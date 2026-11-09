@@ -2,7 +2,6 @@ name: Fork Sync
 
 permissions:
     contents: write
-    workflows: write    # 上游改动 .github/workflows/* 时，GITHUB_TOKEN 需要此权限才能推送
 
 on:
     schedule:
