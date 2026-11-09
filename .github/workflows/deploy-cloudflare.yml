@@ -1,0 +1,86 @@
+# 把 main 分支自动部署到 Cloudflare Worker `22danmu-api`
+#
+# 为什么除了 push 还要有 workflow_run / schedule：
+# 本仓库是 huangxd-/danmu_api 的 fork，每天由 `Fork Sync`(sync_fork.yml) 同步上游。
+# 该工作流用 GITHUB_TOKEN 推送，GitHub 明确规定「由 GITHUB_TOKEN 触发的事件
+# 不会创建新的工作流运行」（仅 workflow_dispatch / repository_dispatch 例外），
+# 所以仅靠 `on: push` 会漏掉每天的上游同步。
+#  - workflow_run: Fork Sync 成功后立即部署（不改动上游跟踪的 sync_fork.yml）
+#  - schedule:     兜底，即使 workflow_run 因 GitHub 排队/延迟没触发，每天也会对齐一次 main
+#  - push:         自己手动 push / 合并时立即部署
+#  - workflow_dispatch: 可在 Actions 页面手动点一次
+#
+# 仓库的 wrangler.toml 已带 keep_vars = true，这里再加 --keep-vars 双保险，
+# 保证 Dashboard 里配置的 7 个运行时变量（TOKEN / ADMIN_TOKEN / TMDB_API_KEY /
+# BILIBILI_COOKIE / DEPLOY_PLATFROM_* 等）不会被部署清空。
+# 仓库没有 package-lock.json，所以安装依赖必须用 npm install，不能用 npm ci。
+
+name: Deploy 22danmu-api to Cloudflare
+
+on:
+  push:
+    branches: [main]
+  workflow_run:
+    workflows: ["Fork Sync"]
+    types: [completed]
+  schedule:
+    - cron: "0 8 * * *" # 08:00 UTC = 16:00 北京时间，Fork Sync 实际在 03:00~06:00 UTC 之间运行
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: cf-deploy-22danmu-api
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    # workflow_run 只在 Fork Sync 成功、且跑在 main 上时才部署；失败的同步不发布
+    if: >-
+      github.event_name != 'workflow_run' ||
+      (github.event.workflow_run.conclusion == 'success' &&
+       github.event.workflow_run.head_branch == 'main')
+    steps:
+      - name: 检查是否已配置 Cloudflare 凭据
+        id: guard
+        env:
+          CF_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+        run: |
+          if [ -z "$CF_TOKEN" ]; then
+            echo "::notice title=跳过部署::尚未在仓库 Secrets 中配置 CLOUDFLARE_API_TOKEN"
+            echo "enabled=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "enabled=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Checkout main
+        if: steps.guard.outputs.enabled == 'true'
+        uses: actions/checkout@v4
+        with:
+          ref: main
+
+      - name: Setup Node.js
+        if: steps.guard.outputs.enabled == 'true'
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Install dependencies
+        if: steps.guard.outputs.enabled == 'true'
+        run: npm install --no-audit --no-fund
+
+      - name: Deploy to Cloudflare Workers
+        if: steps.guard.outputs.enabled == 'true'
+        uses: cloudflare/wrangler-action@v4
+        with:
+          apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          accountId: "e9c0c6f7c7a57d1fab7a2e29a2e5fa28"
+          wranglerVersion: "4.146.0"
+          command: deploy --keep-vars
+
+      - name: 部署结果
+        if: steps.guard.outputs.enabled == 'true'
+        run: echo "已部署 commit ${{ github.sha }} -> Worker 22danmu-api"
